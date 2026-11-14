@@ -49,6 +49,10 @@ pub enum DomainError {
     NothingToInvoice,
     /// The entry is already on an invoice and cannot be edited.
     EntryLocked(Id),
+    /// The milestone is already on an invoice, so its price cannot change.
+    MilestoneLocked(Id),
+    /// A date was not `YYYY-MM-DD`.
+    InvalidDate(String),
 }
 
 impl fmt::Display for DomainError {
@@ -66,6 +70,13 @@ impl fmt::Display for DomainError {
             ),
             Self::NothingToInvoice => write!(f, "there is nothing unbilled to invoice"),
             Self::EntryLocked(id) => write!(f, "time entry {id} is already invoiced"),
+            Self::MilestoneLocked(id) => {
+                write!(
+                    f,
+                    "milestone {id} is already invoiced and cannot change price"
+                )
+            }
+            Self::InvalidDate(s) => write!(f, "not a YYYY-MM-DD date: {s}"),
         }
     }
 }
@@ -126,11 +137,26 @@ pub struct Milestone {
     pub name: String,
     pub amount_cents: i64,
     pub invoice_id: Option<Id>,
+    /// Unix seconds when the milestone was marked delivered. Required before invoicing.
+    pub delivered_at: Option<i64>,
 }
 
 impl Milestone {
     pub fn is_invoiced(&self) -> bool {
         self.invoice_id.is_some()
+    }
+
+    pub fn is_delivered(&self) -> bool {
+        self.delivered_at.is_some()
+    }
+
+    /// Returns an error if the price may not change because the milestone is invoiced.
+    pub fn ensure_amount_editable(&self) -> Result<(), DomainError> {
+        if self.is_invoiced() {
+            Err(DomainError::MilestoneLocked(self.id))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -207,7 +233,8 @@ pub fn hourly_invoice_lines(
     }
 }
 
-/// Lines for a fixed-price project: one per uninvoiced milestone.
+/// Lines for a fixed-price project: one per delivered, uninvoiced milestone.
+/// Undelivered milestones are skipped, so they cannot be invoiced yet.
 pub fn milestone_invoice_lines(
     project: &Project,
     milestones: &[Milestone],
@@ -216,7 +243,7 @@ pub fn milestone_invoice_lines(
 
     let lines: Vec<InvoiceLine> = milestones
         .iter()
-        .filter(|m| m.project_id == project.id && !m.is_invoiced())
+        .filter(|m| m.project_id == project.id && m.is_delivered() && !m.is_invoiced())
         .map(|m| InvoiceLine {
             source: LineSource::Milestone(m.id),
             description: m.name.clone(),
@@ -247,6 +274,88 @@ pub fn transition(from: InvoiceStatus, to: InvoiceStatus) -> Result<InvoiceStatu
         (Draft, Sent) | (Sent, Paid) => Ok(to),
         _ => Err(DomainError::InvalidTransition { from, to }),
     }
+}
+
+/// Date for a Unix timestamp as `YYYY-MM-DD` in UTC.
+/// Uses Howard Hinnant's civil-from-days algorithm, so no date crate is needed.
+pub fn iso_date_from_unix(secs: i64) -> String {
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Converts a valid `YYYY-MM-DD` date to UTC Unix seconds at midnight.
+pub fn iso_date_to_unix_seconds(date: &str) -> Result<i64, DomainError> {
+    days_from_civil(date)?
+        .checked_mul(86_400)
+        .ok_or(DomainError::Overflow)
+}
+
+/// Adds `days` to a valid `YYYY-MM-DD` date and returns the result in the same format.
+/// Uses Hinnant's days-from-civil, so no date crate is needed.
+pub fn add_days(date: &str, days: i64) -> Result<String, DomainError> {
+    let bad = || DomainError::InvalidDate(date.to_string());
+    let target = days_from_civil(date)?
+        .checked_add(days)
+        .ok_or(DomainError::Overflow)?;
+    let seconds = target.checked_mul(86_400).ok_or(DomainError::Overflow)?;
+    let result = iso_date_from_unix(seconds);
+    if result.len() != 10 {
+        return Err(bad());
+    }
+    Ok(result)
+}
+
+/// Parses and validates a Gregorian `YYYY-MM-DD` date, returning days since 1970-01-01.
+fn days_from_civil(date: &str) -> Result<i64, DomainError> {
+    let bad = || DomainError::InvalidDate(date.to_string());
+    let bytes = date.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes[0..4].iter().all(|byte| byte.is_ascii_digit())
+        || !bytes[5..7].iter().all(|byte| byte.is_ascii_digit())
+        || !bytes[8..10].iter().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(bad());
+    }
+    let year = date[0..4].parse::<i64>().map_err(|_| bad())?;
+    let month = date[5..7].parse::<i64>().map_err(|_| bad())?;
+    let day = date[8..10].parse::<i64>().map_err(|_| bad())?;
+    if !(1..=12).contains(&month) {
+        return Err(bad());
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return Err(bad());
+    }
+
+    let adjusted_year = if month <= 2 { year - 1 } else { year };
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let adjusted_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Ok(era * 146_097 + day_of_era - 719_468)
+}
+
+/// Overdue means sent and past due. Due today is not overdue.
+/// Both dates are `YYYY-MM-DD`, so string comparison orders them correctly.
+pub fn is_overdue(status: InvoiceStatus, due_date: &str, today: &str) -> bool {
+    status == InvoiceStatus::Sent && due_date < today
 }
 
 fn require_billing(project: &Project, expected: BillingType) -> Result<(), DomainError> {
@@ -311,8 +420,14 @@ mod tests {
 
     #[test]
     fn negative_inputs_are_rejected() {
-        assert_eq!(amount_for_seconds(-1, 100), Err(DomainError::NegativeAmount));
-        assert_eq!(amount_for_seconds(1, -100), Err(DomainError::NegativeAmount));
+        assert_eq!(
+            amount_for_seconds(-1, 100),
+            Err(DomainError::NegativeAmount)
+        );
+        assert_eq!(
+            amount_for_seconds(1, -100),
+            Err(DomainError::NegativeAmount)
+        );
     }
 
     #[test]
@@ -361,7 +476,10 @@ mod tests {
     #[test]
     fn empty_hourly_selection_is_an_error() {
         let p = project(BillingType::Hourly, 5_000);
-        assert_eq!(hourly_invoice_lines(&p, &[]), Err(DomainError::NothingToInvoice));
+        assert_eq!(
+            hourly_invoice_lines(&p, &[]),
+            Err(DomainError::NothingToInvoice)
+        );
     }
 
     #[test]
@@ -386,6 +504,7 @@ mod tests {
                 name: "Design".into(),
                 amount_cents: 40_000,
                 invoice_id: None,
+                delivered_at: Some(100),
             },
             Milestone {
                 id: 2,
@@ -393,12 +512,71 @@ mod tests {
                 name: "Build".into(),
                 amount_cents: 60_000,
                 invoice_id: Some(7),
+                delivered_at: Some(100),
             },
         ];
         let lines = milestone_invoice_lines(&p, &milestones).unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].source, LineSource::Milestone(1));
         assert_eq!(lines[0].quantity_seconds, None);
+    }
+
+    #[test]
+    fn undelivered_milestones_are_not_invoiced() {
+        let p = project(BillingType::FixedPrice, 0);
+        let milestones = vec![Milestone {
+            id: 1,
+            project_id: 1,
+            name: "Design".into(),
+            amount_cents: 40_000,
+            invoice_id: None,
+            delivered_at: None,
+        }];
+        assert_eq!(
+            milestone_invoice_lines(&p, &milestones),
+            Err(DomainError::NothingToInvoice)
+        );
+    }
+
+    #[test]
+    fn invoiced_milestone_price_is_locked() {
+        let mut m = Milestone {
+            id: 3,
+            project_id: 1,
+            name: "Build".into(),
+            amount_cents: 60_000,
+            invoice_id: None,
+            delivered_at: Some(100),
+        };
+        assert!(m.ensure_amount_editable().is_ok());
+        m.invoice_id = Some(9);
+        assert_eq!(
+            m.ensure_amount_editable(),
+            Err(DomainError::MilestoneLocked(3))
+        );
+    }
+
+    #[test]
+    fn unix_seconds_convert_to_iso_date() {
+        assert_eq!(iso_date_from_unix(0), "1970-01-01");
+        assert_eq!(iso_date_from_unix(86_399), "1970-01-01");
+        assert_eq!(iso_date_from_unix(86_400), "1970-01-02");
+        // 2000-02-29 00:00:00 UTC, a leap day.
+        assert_eq!(iso_date_from_unix(951_782_400), "2000-02-29");
+        // 2026-11-01 00:00:00 UTC.
+        assert_eq!(iso_date_from_unix(1_793_491_200), "2026-11-01");
+    }
+
+    #[test]
+    fn overdue_only_when_sent_and_past_due() {
+        use InvoiceStatus::*;
+        assert!(is_overdue(Sent, "2026-10-31", "2026-11-01"));
+        // Due today is not overdue.
+        assert!(!is_overdue(Sent, "2026-11-01", "2026-11-01"));
+        assert!(!is_overdue(Sent, "2026-11-30", "2026-11-01"));
+        // Drafts and paid invoices are never overdue.
+        assert!(!is_overdue(Draft, "2026-10-31", "2026-11-01"));
+        assert!(!is_overdue(Paid, "2026-10-31", "2026-11-01"));
     }
 
     #[test]
@@ -428,6 +606,26 @@ mod tests {
         ];
         assert_eq!(invoice_total(&lines), Ok(17_345));
         assert_eq!(invoice_total(&[]), Ok(0));
+    }
+
+    #[test]
+    fn add_days_handles_month_and_leap_boundaries() {
+        assert_eq!(add_days("2026-11-01", 30).unwrap(), "2026-12-01");
+        assert_eq!(add_days("2026-12-31", 1).unwrap(), "2027-01-01");
+        assert_eq!(add_days("2024-02-28", 1).unwrap(), "2024-02-29");
+        assert_eq!(add_days("2026-02-28", 1).unwrap(), "2026-03-01");
+        assert_eq!(add_days("2026-11-01", 0).unwrap(), "2026-11-01");
+        assert_eq!(add_days("2026-11-10", -9).unwrap(), "2026-11-01");
+    }
+
+    #[test]
+    fn add_days_rejects_malformed_dates() {
+        assert!(add_days("1 Nov 2026", 1).is_err());
+        assert!(add_days("2026-13-01", 1).is_err());
+        assert!(add_days("2026-11-00", 1).is_err());
+        assert!(add_days("2026-02-31", 1).is_err());
+        assert!(add_days("2025-02-29", 1).is_err());
+        assert_eq!(add_days("2024-02-29", 1).unwrap(), "2024-03-01");
     }
 
     #[test]
