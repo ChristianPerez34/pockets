@@ -46,7 +46,7 @@ struct Shell {
     db_status: String,
     data_dir: PathBuf,
     store: Option<storage::Store>,
-    focus_handle: FocusHandle,
+    focus_handle: Option<FocusHandle>,
     page: Page,
     active_field: Option<Field>,
     text_cursor: usize,
@@ -154,6 +154,17 @@ impl Shell {
         db_status: String,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::build(store, data_dir, db_status, Some(cx.focus_handle()))
+    }
+
+    /// Builds the shell without a GPUI app context so the state machine can be
+    /// driven headlessly from tests. The real entry point always supplies a handle.
+    fn build(
+        store: Option<storage::Store>,
+        data_dir: PathBuf,
+        db_status: String,
+        focus_handle: Option<FocusHandle>,
+    ) -> Self {
         let today = domain::iso_date_from_unix(storage::now_unix());
         let setting = |key: &str, default: &str| {
             store
@@ -170,7 +181,7 @@ impl Shell {
             db_status,
             data_dir,
             store,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             page: if business_name.trim().is_empty() {
                 Page::Settings
             } else {
@@ -309,6 +320,14 @@ impl Shell {
         } else {
             Some(problems.join(" · "))
         };
+    }
+
+    /// Focuses the root element when running inside a real window. Headless
+    /// builds (tests) have no window, so this is a no-op there.
+    fn focus_root(&self, window: &mut Window) {
+        if let Some(handle) = &self.focus_handle {
+            handle.focus(window);
+        }
     }
 
     fn field_value(&self, field: Field) -> &str {
@@ -450,7 +469,7 @@ impl Shell {
                 cx.listener(move |this, _, window, cx| {
                     this.active_field = Some(field);
                     this.text_cursor = this.field_value(field).len();
-                    this.focus_handle.focus(window);
+                    this.focus_root(window);
                     cx.notify();
                 }),
             );
@@ -462,7 +481,7 @@ impl Shell {
                     this.field_value_mut(field).clear();
                     this.active_field = Some(field);
                     this.text_cursor = 0;
-                    this.focus_handle.focus(window);
+                    this.focus_root(window);
                     cx.notify();
                 }),
             ));
@@ -504,7 +523,7 @@ impl Shell {
                     this.page = page;
                     this.active_field = None;
                     this.confirm_cancel_invoice = false;
-                    this.focus_handle.focus(window);
+                    this.focus_root(window);
                     cx.notify();
                 }),
             )
@@ -554,7 +573,7 @@ impl Shell {
                 cx.listener(move |this, _, window, cx| {
                     this.page = page;
                     this.active_field = None;
-                    this.focus_handle.focus(window);
+                    this.focus_root(window);
                     cx.notify();
                 }),
             )
@@ -2422,16 +2441,20 @@ impl Render for Shell {
             .child(messages)
             .child(page_area);
 
-        div()
+        let root = div()
             .size_full()
             .bg(rgb(0xf4f6f4))
             .flex()
-            .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event, _window, cx| {
                 this.handle_key(event, cx);
             }))
             .child(sidebar)
-            .child(main)
+            .child(main);
+        let root = match &self.focus_handle {
+            Some(handle) => root.track_focus(handle),
+            None => root,
+        };
+        root
     }
 }
 
@@ -2704,5 +2727,257 @@ mod text_edit_tests {
         assert!(changed);
         assert_eq!(value, "caé");
         assert_eq!(cursor, 2);
+    }
+}
+
+/// Headless tests for the app shell: the page state machine and the
+/// create → track → invoice workflow, driven without a window.
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    fn shell() -> Shell {
+        Shell::build(
+            Some(storage::Store::open_in_memory().expect("in-memory store")),
+            PathBuf::from("."),
+            "test database".to_string(),
+            None,
+        )
+    }
+
+    fn error_text(shell: &Shell) -> String {
+        shell.error.clone().unwrap_or_default()
+    }
+
+    #[test]
+    fn first_run_opens_settings_until_a_business_name_exists() {
+        assert_eq!(shell().page, Page::Settings);
+    }
+
+    #[test]
+    fn saving_settings_persists_values_and_advances_to_the_overview() {
+        let mut app = shell();
+        app.business_name = "Acme Studio".to_string();
+        app.currency = "eur".to_string();
+        app.invoice_prefix = "acme-".to_string();
+        app.save_settings();
+
+        assert!(
+            app.error.is_none(),
+            "unexpected error: {}",
+            error_text(&app)
+        );
+        assert_eq!(app.page, Page::Overview);
+        assert_eq!(app.currency, "EUR");
+        assert_eq!(app.invoice_prefix, "ACME-");
+
+        let store = app.store.as_ref().expect("store");
+        assert_eq!(
+            store.get_setting("business_name").unwrap().as_deref(),
+            Some("Acme Studio")
+        );
+    }
+
+    #[test]
+    fn an_invalid_currency_is_rejected_before_anything_is_written() {
+        let mut app = shell();
+        app.business_name = "Acme".to_string();
+        app.currency = "EURO".to_string();
+        app.save_settings();
+
+        assert!(error_text(&app).contains("Currency"));
+        assert_eq!(app.page, Page::Settings);
+        let store = app.store.as_ref().expect("store");
+        // The seeded default survives; "Acme" was never written.
+        assert_eq!(
+            store.get_setting("business_name").unwrap().as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn an_invalid_invoice_prefix_is_rejected() {
+        let mut app = shell();
+        app.business_name = "Acme".to_string();
+        app.invoice_prefix = "no spaces".to_string();
+        app.save_settings();
+
+        assert!(error_text(&app).contains("prefix"));
+        assert_eq!(app.page, Page::Settings);
+    }
+
+    #[test]
+    fn creating_a_client_persists_and_selects_it() {
+        let mut app = shell();
+        app.client_name = "Northwind".to_string();
+        app.client_contact = "ops@northwind.test".to_string();
+        app.payment_terms = "14".to_string();
+        app.save_client();
+
+        assert!(
+            app.error.is_none(),
+            "unexpected error: {}",
+            error_text(&app)
+        );
+        assert_eq!(app.clients.len(), 1);
+        assert_eq!(app.clients[0].name, "Northwind");
+        assert_eq!(app.clients[0].payment_terms_days, 14);
+        assert_eq!(app.selected_client_id, Some(app.clients[0].id));
+        // The form resets so the next entry starts clean.
+        assert_eq!(app.client_name, "");
+        assert_eq!(app.payment_terms, "30");
+    }
+
+    #[test]
+    fn a_client_without_a_name_is_rejected() {
+        let mut app = shell();
+        app.client_name = "   ".to_string();
+        app.save_client();
+
+        assert_eq!(app.clients.len(), 0);
+        assert!(error_text(&app).contains("Client name"));
+    }
+
+    #[test]
+    fn payment_terms_outside_the_allowed_range_are_rejected() {
+        let mut app = shell();
+        app.client_name = "Northwind".to_string();
+        app.payment_terms = "99999".to_string();
+        app.save_client();
+
+        assert_eq!(app.clients.len(), 0);
+        assert!(error_text(&app).contains("Payment terms"));
+    }
+
+    #[test]
+    fn starting_a_timer_without_a_project_reports_an_error() {
+        let mut app = shell();
+        app.start_timer();
+
+        assert!(app.running_timer.is_none());
+        assert!(error_text(&app).contains("project"));
+    }
+
+    #[test]
+    fn creating_a_project_without_a_client_reports_an_error() {
+        let mut app = shell();
+        app.project_name = "Website".to_string();
+        app.create_project();
+
+        assert_eq!(app.projects.len(), 0);
+        assert!(error_text(&app).contains("client"));
+    }
+
+    #[test]
+    fn creating_an_invoice_without_a_business_name_routes_to_settings() {
+        let mut app = shell();
+        app.business_name = "Acme".to_string();
+        app.save_settings();
+        assert_eq!(app.page, Page::Overview);
+
+        app.business_name.clear();
+        app.create_invoice();
+
+        assert_eq!(app.page, Page::Settings);
+        assert!(error_text(&app).contains("business name"));
+        assert_eq!(app.invoices.len(), 0);
+    }
+
+    /// The headline workflow: set up a business, add a client and project,
+    /// record billable time, draft an invoice, and send it.
+    #[test]
+    fn create_track_and_invoice_flow_runs_end_to_end() {
+        let mut app = shell();
+
+        app.business_name = "Acme Studio".to_string();
+        app.save_settings();
+        assert_eq!(app.page, Page::Overview);
+
+        app.client_name = "Northwind".to_string();
+        app.save_client();
+        assert!(
+            app.error.is_none(),
+            "client step failed: {}",
+            error_text(&app)
+        );
+
+        app.project_name = "Website".to_string();
+        app.project_rate = "120.00".to_string();
+        app.create_project();
+        assert!(
+            app.error.is_none(),
+            "project step failed: {}",
+            error_text(&app)
+        );
+        let project_id = app.selected_project_id.expect("project selected");
+
+        // One deterministic billable hour, independent of the wall clock.
+        app.manual_description = "Design".to_string();
+        app.manual_date = "2024-03-04".to_string();
+        app.manual_start = "09:00".to_string();
+        app.manual_end_date = "2024-03-04".to_string();
+        app.manual_end = "10:00".to_string();
+        app.manual_billable = true;
+        app.save_manual_entry();
+        assert!(
+            app.error.is_none(),
+            "time step failed: {}",
+            error_text(&app)
+        );
+        assert_eq!(app.entries.len(), 1);
+
+        app.create_invoice();
+        assert!(
+            app.error.is_none(),
+            "invoice step failed: {}",
+            error_text(&app)
+        );
+        let invoice = app.invoices[0].clone();
+        assert_eq!(invoice.status, domain::InvoiceStatus::Draft);
+        assert_eq!(invoice.project_id, project_id);
+        // One hour at 120.00 is 12,000 cents.
+        assert_eq!(invoice.total_cents, 12_000);
+
+        app.selected_invoice_id = Some(invoice.id);
+        app.mark_invoice_sent();
+        assert!(
+            app.error.is_none(),
+            "send step failed: {}",
+            error_text(&app)
+        );
+        let sent = app
+            .invoices
+            .iter()
+            .find(|item| item.id == invoice.id)
+            .expect("invoice");
+        assert_eq!(sent.status, domain::InvoiceStatus::Sent);
+        assert_eq!(sent.number.as_deref(), Some("INV-0001"));
+
+        // Sending reserves the billable time, so it cannot be invoiced twice.
+        app.create_invoice();
+        assert!(error_text(&app).contains("nothing"), "{}", error_text(&app));
+        assert_eq!(app.invoices.len(), 1);
+    }
+
+    #[test]
+    fn refresh_keeps_a_valid_selection_and_replaces_a_deleted_one() {
+        let mut app = shell();
+        app.client_name = "Northwind".to_string();
+        app.save_client();
+        app.client_name = "Contoso".to_string();
+        app.save_client();
+        assert_eq!(app.clients.len(), 2);
+
+        let first = app.clients[0].id;
+        let second = app.clients[1].id;
+        app.selected_client_id = Some(first);
+        app.refresh();
+        assert_eq!(app.selected_client_id, Some(first));
+
+        app.selected_client_id = Some(9_999);
+        app.refresh();
+        assert_eq!(app.selected_client_id, Some(first));
+        assert_eq!(app.selected_client_id, app.clients.first().map(|c| c.id));
+        assert!(app.clients.iter().any(|c| c.id == second));
     }
 }
