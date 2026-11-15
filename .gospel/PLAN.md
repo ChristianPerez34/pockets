@@ -1,30 +1,32 @@
 # Plan
 
 ## Goal
-Add deterministic, headless automated tests for the GPUI app shell (navigation, forms, timer, invoicing) so app functionality is verifiable without a human clicking a window.
+Add deterministic automated tests for the GPUI app, including real UI interaction (clicks, typing) driven headlessly, so app behaviour is verifiable without a human using the window.
 
 ## Steps
-- [x] Audit what is currently untested: 49 tests covered `domain` + `storage` only; zero tests for the `Shell` UI/state layer.
-- [x] Confirm GPUI 0.2.2 ships `test-support` feature and `TestAppContext` (headless `TestPlatform`).
-- [x] Confirm most `Shell` handlers are `&mut self` only (no `cx`), so only `Shell::new` needs a real GPUI context.
-- [x] Attempt `gpui` `test-support` dev-dependency: FAILED offline — pulls `git2`/`libgit2-sys` which are absent from the vendor cache.
-- [x] Fallback refactor: split `Shell::new` into `new` (supplies `Some(cx.focus_handle())`) + `build` (takes `Option<FocusHandle>`), add `focus_root` helper, make `track_focus` conditional. 5 UI call sites, no behavior change.
-- [x] Add 12 headless `shell_tests` driving real handlers against an in-memory SQLite store.
-- [x] Prove the tests bite: injected a deliberate regression (`payment_terms = "45"`) and confirmed it failed exactly one test, then reverted.
-- [x] Full suite, fmt, build, and binary-launch smoke check all pass.
+- [x] Add 12 headless `shell_tests` driving `&mut self` handlers against in-memory SQLite (commit 068421f).
+- [x] Determine the real click-simulation path: gpui 0.2.2 `VisualTestContext::simulate_click` / `simulate_input` / `simulate_keystrokes`, all gated behind `#[cfg(any(test, feature = "test-support"))]`.
+- [x] Enable it: `gpui = { version = "0.2.2", features = ["test-support"] }` as a dev-dependency. Network was reachable this time; pulls 8 crates (backtrace -> git2/libgit2-sys chain) into Cargo.lock, dev builds only.
+- [x] Confirm production `cargo build --locked` is unaffected (dev-dependencies are not resolved for the bin).
+- [x] Discover that `Div::debug_selector` is **private** in the published crate, so selector-based `debug_bounds` lookups are unusable from a downstream crate -> element targeting must be coordinate-based.
+- [x] Empirically calibrate layout geometry with throwaway probe tests (nav rail pitch, Settings item, form field centres) instead of guessing.
+- [x] Add 3 real UI tests: nav rail switches pages on click; clicking a field focuses only that field and typing edits it; Enter releases focus.
+- [x] Prove they bite: forcing `this.page = Page::Overview` in the nav listener failed exactly the nav test with "clicking nav item 1 at y=252".
+- [x] Full suite (64), fmt, build, whitespace check all pass.
 
 ## Evidence / Verification
-- `cargo test --locked --offline`: **61 passed, 0 failed** (was 49).
-- `cargo fmt --all -- --check`, `cargo build --locked --offline`, `git diff --check` pass.
-- Binary still launches and idles without panicking (12s run, no crash) after the `Option<FocusHandle>` change.
-- Mutation check: `creating_a_client_persists_and_selects_it` failed with `left: "45", right: "30"` on the injected bug; reverted and green again.
-- gpui-0.2.2 `test-support = [leak-detection, collections/test-support, rand, util/test-support, http_client/test-support, wayland, x11]`; `leak-detection` -> `backtrace` -> `git2`, unavailable offline.
+- `cargo test --locked`: **64 passed, 0 failed** (49 domain/storage -> 61 with shell tests -> 64 with UI tests).
+- `cargo build --locked` compiles the bin with only the two pre-existing dead-code warnings.
+- `cargo fmt --all -- --check` and `git diff --check` clean; no probe/println leftovers.
+- Calibrated geometry: nav items 48px tall on a 56px pitch with the first centre at y≈196 and Settings pinned at y≈632 (1000x760 window; rail 232px wide, x=116 inside it). Settings form fields repeat on a ~90px pitch: BusinessName y≈320, BusinessAddress y≈420, at x=400 (content column starts at x=256).
+- Mutations confirmed the tests fail when behaviour regresses (payment terms 30->45 caught by shell test; nav target hardcoded caught by UI test).
 
 ## Open Questions / Risks
-- Tests cover state/behavior, not rendered pixels. Layout/visual regressions still need a human or a display-automation pass.
-- If the network becomes available, swapping in `gpui` `test-support` would allow true render + synthetic click tests (`TestAppContext`, `simulate_click`).
+- Coordinate constants are the main fragility: they are tied to font metrics and to the `p_3`/`p_6`/`gap_*` spacing in the markup. A text-size or padding change silently shifts targets. Mitigation: the constants are named and documented, and the failure message names the item and the coordinate. Driving render from shared constants would remove the duplication.
+- No pixel-level assertions: a visually broken but correctly-wired layout still passes. Screenshot comparison is the next tier.
+- Visual verification still requires a human or a display-automation pass.
+- Dev-only dependency cost: `leak-detection -> backtrace -> git2/libgit2-sys` adds native build time to `cargo test` (once).
 - Pre-existing dead-code warnings (`is_overdue`, `project_total_seconds`, `project_milestone_total`, `duplicate_invoice_draft`) remain in non-test builds.
-- Product decisions still open: tax, PDF destination, email delivery, installer target.
 
 ## Next Action
-Commit the shell test harness; then optionally add tests for project/milestone edit paths and invoice cancel/export.
+Commit the UI click tests; then extend coverage to the write path (fill the Settings form, click Save, assert persistence and the Overview transition) using the same calibrated-geometry approach.

@@ -2981,3 +2981,150 @@ mod shell_tests {
         assert!(app.clients.iter().any(|c| c.id == second));
     }
 }
+
+/// Drives the real UI: renders `Shell` into a headless GPUI window and
+/// dispatches genuine mouse events through the platform event path, so
+/// hit-testing, listeners and focus all run exactly as they do in the app.
+#[cfg(test)]
+mod ui_click_tests {
+    use super::*;
+    use gpui::{Bounds, Entity, Modifiers, TestAppContext, VisualTestContext, point, size};
+
+    const WINDOW_W: f32 = 1000.0;
+    const WINDOW_H: f32 = 760.0;
+    // The nav rail is 232px wide with 16px padding on every side.
+    const NAV_CLICK_X: f32 = 116.0;
+    // Nav items are 48px tall (p_3 padding around 24px of content) and are
+    // stacked with an 8px gap, so they repeat on a 56px pitch. The first item
+    // starts below the 16px rail padding, the brand block and the
+    // "WORKSPACE" label, which puts its centre at ~196px.
+    const NAV_FIRST_CENTER_Y: f32 = 196.0;
+    const NAV_ITEM_PITCH: f32 = 56.0;
+    // The Settings item is pushed to the bottom of the rail by a flex spacer.
+    const NAV_SETTINGS_CENTER_Y: f32 = 632.0;
+    // The content column starts at x = 232 (rail) + 24 (p_6) = 256, so x=400
+    // lands inside a full-width form input. Settings fields repeat on a ~90px
+    // pitch (label + 48px input + gap).
+    const FORM_CLICK_X: f32 = 400.0;
+    const FIELD_BUSINESS_NAME_Y: f32 = 320.0;
+    const FIELD_BUSINESS_ADDRESS_Y: f32 = 420.0;
+
+    fn open_shell(cx: &mut TestAppContext) -> (Entity<Shell>, VisualTestContext) {
+        let mut shell = None;
+        let handle = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(WINDOW_W), px(WINDOW_H)),
+                    ))),
+                    ..Default::default()
+                },
+                |_window, cx| {
+                    let entity = cx.new(|cx| {
+                        Shell::new(
+                            Some(storage::Store::open_in_memory().expect("store")),
+                            PathBuf::from("."),
+                            "test database".to_string(),
+                            cx,
+                        )
+                    });
+                    shell = Some(entity.clone());
+                    entity
+                },
+            )
+            .expect("open window")
+        });
+        let visual = VisualTestContext::from_window(handle.into(), cx);
+        (shell.expect("shell entity"), visual)
+    }
+
+    fn click(visual: &mut VisualTestContext, x: f32, y: f32) {
+        visual.simulate_click(point(px(x), px(y)), Modifiers::none());
+        visual.run_until_parked();
+    }
+
+    fn state(visual: &mut VisualTestContext, shell: &Entity<Shell>) -> (Page, Option<Field>) {
+        visual.update(|_, cx| {
+            let shell = shell.read(cx);
+            (shell.page, shell.active_field)
+        })
+    }
+
+    #[test]
+    fn the_nav_rail_switches_pages_when_clicked() {
+        let mut cx = TestAppContext::single();
+        let (shell, mut visual) = open_shell(&mut cx);
+        assert_eq!(
+            state(&mut visual, &shell).0,
+            Page::Settings,
+            "first run opens settings"
+        );
+
+        for (index, page) in [
+            Page::Overview,
+            Page::Time,
+            Page::Clients,
+            Page::Projects,
+            Page::Invoices,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let y = NAV_FIRST_CENTER_Y + index as f32 * NAV_ITEM_PITCH;
+            click(&mut visual, NAV_CLICK_X, y);
+            assert_eq!(
+                state(&mut visual, &shell).0,
+                page,
+                "clicking nav item {index} at y={y}"
+            );
+        }
+
+        click(&mut visual, NAV_CLICK_X, NAV_SETTINGS_CENTER_Y);
+        assert_eq!(state(&mut visual, &shell).0, Page::Settings);
+    }
+
+    #[test]
+    fn clicking_a_field_focuses_only_that_field_and_typing_edits_it() {
+        let mut cx = TestAppContext::single();
+        let (shell, mut visual) = open_shell(&mut cx);
+
+        click(&mut visual, FORM_CLICK_X, FIELD_BUSINESS_NAME_Y);
+        assert_eq!(state(&mut visual, &shell).1, Some(Field::BusinessName));
+
+        visual.simulate_input("Acme Studio");
+        visual.run_until_parked();
+        assert_eq!(
+            visual.update(|_, cx| shell.read(cx).business_name.clone()),
+            "Acme Studio"
+        );
+
+        click(&mut visual, FORM_CLICK_X, FIELD_BUSINESS_ADDRESS_Y);
+        assert_eq!(state(&mut visual, &shell).1, Some(Field::BusinessAddress));
+
+        visual.simulate_input("12 Main St");
+        visual.run_until_parked();
+        assert_eq!(
+            visual.update(|_, cx| shell.read(cx).business_address.clone()),
+            "12 Main St"
+        );
+        // Typing in the second field must not disturb the first.
+        assert_eq!(
+            visual.update(|_, cx| shell.read(cx).business_name.clone()),
+            "Acme Studio"
+        );
+    }
+
+    #[test]
+    fn pressing_enter_releases_the_focused_field() {
+        let mut cx = TestAppContext::single();
+        let (shell, mut visual) = open_shell(&mut cx);
+
+        click(&mut visual, FORM_CLICK_X, FIELD_BUSINESS_NAME_Y);
+        assert_eq!(state(&mut visual, &shell).1, Some(Field::BusinessName));
+
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        assert_eq!(state(&mut visual, &shell).1, None);
+    }
+}
