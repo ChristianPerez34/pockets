@@ -3009,14 +3009,31 @@ mod ui_click_tests {
     const FIELD_BUSINESS_NAME_Y: f32 = 320.0;
     const FIELD_BUSINESS_ADDRESS_Y: f32 = 420.0;
 
+    // "Save settings" sits at y≈798, below the fold of a 760px window. The
+    // app opens with `WindowOptions::default()`, which measures 1536×864, so
+    // this test uses that real default viewport. Fields above the button keep
+    // the same offsets because the content column is top-anchored and
+    // left-aligned.
+    const SETTINGS_WINDOW_W: f32 = 1536.0;
+    const SETTINGS_WINDOW_H: f32 = 864.0;
+    const SETTINGS_SAVE_Y: f32 = 798.0;
+
     fn open_shell(cx: &mut TestAppContext) -> (Entity<Shell>, VisualTestContext) {
+        open_shell_sized(cx, WINDOW_W, WINDOW_H)
+    }
+
+    fn open_shell_sized(
+        cx: &mut TestAppContext,
+        window_w: f32,
+        window_h: f32,
+    ) -> (Entity<Shell>, VisualTestContext) {
         let mut shell = None;
         let handle = cx.update(|cx| {
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(
                         point(px(0.), px(0.)),
-                        size(px(WINDOW_W), px(WINDOW_H)),
+                        size(px(window_w), px(window_h)),
                     ))),
                     ..Default::default()
                 },
@@ -3049,6 +3066,56 @@ mod ui_click_tests {
             let shell = shell.read(cx);
             (shell.page, shell.active_field)
         })
+    }
+
+    #[test]
+    fn filling_the_settings_form_and_clicking_save_persists_and_advances() {
+        let mut cx = TestAppContext::single();
+        let (shell, mut visual) = open_shell_sized(&mut cx, SETTINGS_WINDOW_W, SETTINGS_WINDOW_H);
+        assert_eq!(state(&mut visual, &shell).0, Page::Settings);
+
+        click(&mut visual, FORM_CLICK_X, FIELD_BUSINESS_NAME_Y);
+        visual.simulate_input("  Acme Studio  ");
+        visual.run_until_parked();
+        assert_eq!(
+            state(&mut visual, &shell).1,
+            Some(Field::BusinessName),
+            "typing must not move focus"
+        );
+
+        click(&mut visual, FORM_CLICK_X, SETTINGS_SAVE_Y);
+
+        let (page, field, error, status) = visual.update(|_, cx| {
+            let shell = shell.read(cx);
+            (
+                shell.page,
+                shell.active_field,
+                shell.error.clone(),
+                shell.status.clone(),
+            )
+        });
+        assert_eq!(error, None, "save should not report an error");
+        assert_eq!(page, Page::Overview, "saving closes the settings page");
+        assert_eq!(field, None, "saving releases focus");
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|status| status.contains("settings saved")),
+            "expected a confirmation, got {status:?}"
+        );
+
+        // The click has to reach the database, not just the in-memory field,
+        // and the surrounding whitespace has to be trimmed on the way in.
+        let stored = visual.update(|_, cx| {
+            let shell = shell.read(cx);
+            shell
+                .store
+                .as_ref()
+                .expect("store")
+                .get_setting("business_name")
+                .expect("read setting")
+        });
+        assert_eq!(stored.as_deref(), Some("Acme Studio"));
     }
 
     #[test]

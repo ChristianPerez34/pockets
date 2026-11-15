@@ -5,28 +5,27 @@ Add deterministic automated tests for the GPUI app, including real UI interactio
 
 ## Steps
 - [x] Add 12 headless `shell_tests` driving `&mut self` handlers against in-memory SQLite (commit 068421f).
-- [x] Determine the real click-simulation path: gpui 0.2.2 `VisualTestContext::simulate_click` / `simulate_input` / `simulate_keystrokes`, all gated behind `#[cfg(any(test, feature = "test-support"))]`.
-- [x] Enable it: `gpui = { version = "0.2.2", features = ["test-support"] }` as a dev-dependency. Network was reachable this time; pulls 8 crates (backtrace -> git2/libgit2-sys chain) into Cargo.lock, dev builds only.
-- [x] Confirm production `cargo build --locked` is unaffected (dev-dependencies are not resolved for the bin).
-- [x] Discover that `Div::debug_selector` is **private** in the published crate, so selector-based `debug_bounds` lookups are unusable from a downstream crate -> element targeting must be coordinate-based.
-- [x] Empirically calibrate layout geometry with throwaway probe tests (nav rail pitch, Settings item, form field centres) instead of guessing.
-- [x] Add 3 real UI tests: nav rail switches pages on click; clicking a field focuses only that field and typing edits it; Enter releases focus.
-- [x] Prove they bite: forcing `this.page = Page::Overview` in the nav listener failed exactly the nav test with "clicking nav item 1 at y=252".
-- [x] Full suite (64), fmt, build, whitespace check all pass.
+- [x] Enable `gpui` `test-support` as a dev-dependency and drive real mouse/key events through `VisualTestContext` (commit 294dae4): nav switching, field focus + typing, Enter releasing focus.
+- [x] Calibrate layout geometry empirically with throwaway probe tests (nav pitch, form field positions, Save button).
+- [x] Add the first full user-task test: fill BusinessName via a click + typing, click "Save settings", assert no error, page advances to Overview, focus is released, confirmation status is set, and the value is trimmed + persisted to SQLite.
+- [x] Prove it bites: dropping `.trim()` from `save_settings` failed with `left: Some("  Acme Studio  "), right: Some("Acme Studio")`.
+- [x] Measure the app's real default viewport (1536×864) and use it for the settings test rather than an arbitrary size.
+- [x] Full suite (65), fmt, build, whitespace check all pass.
 
 ## Evidence / Verification
-- `cargo test --locked`: **64 passed, 0 failed** (49 domain/storage -> 61 with shell tests -> 64 with UI tests).
-- `cargo build --locked` compiles the bin with only the two pre-existing dead-code warnings.
+- `cargo test --locked`: **65 passed, 0 failed**.
+- `cargo build --locked`: bin compiles with only the two pre-existing dead-code warnings.
 - `cargo fmt --all -- --check` and `git diff --check` clean; no probe/println leftovers.
-- Calibrated geometry: nav items 48px tall on a 56px pitch with the first centre at y≈196 and Settings pinned at y≈632 (1000x760 window; rail 232px wide, x=116 inside it). Settings form fields repeat on a ~90px pitch: BusinessName y≈320, BusinessAddress y≈420, at x=400 (content column starts at x=256).
-- Mutations confirmed the tests fail when behaviour regresses (payment terms 30->45 caught by shell test; nav target hardcoded caught by UI test).
+- Calibrated geometry (1000×760 window unless noted): nav items 48px on a 56px pitch, first centre y≈196, Settings pinned at y≈632; rail 232px, x=116 inside it.
+- Settings form (top-anchored, x=400): fields on a 96px pitch — BusinessName ≈320, BusinessAddress ≈416, BusinessContact ≈512, Currency ≈608, InvoicePrefix ≈704, each 48px tall; hint text then "Save settings" spanning y≈778–820 (centre 798).
+- Real default viewport measured via `window.viewport_size()` with `WindowOptions::default()`: 1536×864.
 
 ## Open Questions / Risks
-- Coordinate constants are the main fragility: they are tied to font metrics and to the `p_3`/`p_6`/`gap_*` spacing in the markup. A text-size or padding change silently shifts targets. Mitigation: the constants are named and documented, and the failure message names the item and the coordinate. Driving render from shared constants would remove the duplication.
+- **Save settings needs ~820px of window height and the page does not scroll.** The default 864px viewport leaves only ~44px of headroom; a user who resizes below ~820 cannot save settings at all, with no scroll affordance. Not a bug out of the box, but a real fragility. Fix would be `overflow_y_scroll` on the content column, which changes layout and requires recalibrating every coordinate above.
+- Coordinate constants remain the main fragility: tied to font metrics and `p_3`/`p_6`/`gap_*` in the markup. Driving render from shared constants would remove the duplication.
 - No pixel-level assertions: a visually broken but correctly-wired layout still passes. Screenshot comparison is the next tier.
-- Visual verification still requires a human or a display-automation pass.
-- Dev-only dependency cost: `leak-detection -> backtrace -> git2/libgit2-sys` adds native build time to `cargo test` (once).
+- Dev-only dependency cost: `test-support` pulls backtrace -> git2/libgit2-sys, adding native build time to `cargo test` (one-time).
 - Pre-existing dead-code warnings (`is_overdue`, `project_total_seconds`, `project_milestone_total`, `duplicate_invoice_draft`) remain in non-test builds.
 
 ## Next Action
-Commit the UI click tests; then extend coverage to the write path (fill the Settings form, click Save, assert persistence and the Overview transition) using the same calibrated-geometry approach.
+Commit the settings-save test; then decide on the no-scroll clipping risk — either add `overflow_y_scroll` to the content column (and recalibrate coordinates) or shrink the settings vertical rhythm so the Save button fits a 700px window.
