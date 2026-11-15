@@ -2988,7 +2988,10 @@ mod shell_tests {
 #[cfg(test)]
 mod ui_click_tests {
     use super::*;
-    use gpui::{Bounds, Entity, Modifiers, TestAppContext, VisualTestContext, point, size};
+    use gpui::{
+        Bounds, Entity, Modifiers, Pixels, ScrollDelta, ScrollWheelEvent, TestAppContext,
+        TouchPhase, VisualTestContext, point, size,
+    };
 
     const WINDOW_W: f32 = 1000.0;
     const WINDOW_H: f32 = 760.0;
@@ -3003,23 +3006,32 @@ mod ui_click_tests {
     // The Settings item is pushed to the bottom of the rail by a flex spacer.
     const NAV_SETTINGS_CENTER_Y: f32 = 632.0;
     // The content column starts at x = 232 (rail) + 24 (p_6) = 256, so x=400
-    // lands inside a full-width form input. Settings fields repeat on a ~90px
-    // pitch (label + 48px input + gap).
+    // lands inside a full-width form input. These are input centres that were
+    // verified by clicking them, not a derived pitch.
     const FORM_CLICK_X: f32 = 400.0;
     const FIELD_BUSINESS_NAME_Y: f32 = 320.0;
     const FIELD_BUSINESS_ADDRESS_Y: f32 = 420.0;
+    const FIELD_CURRENCY_Y: f32 = 600.0;
+    const FIELD_INVOICE_PREFIX_Y: f32 = 700.0;
 
-    // "Save settings" sits at y≈798, below the fold of a 760px window. The
-    // app opens with `WindowOptions::default()`, which measures 1536×864, so
-    // this test uses that real default viewport. Fields above the button keep
-    // the same offsets because the content column is top-anchored and
-    // left-aligned.
-    const SETTINGS_WINDOW_W: f32 = 1536.0;
-    const SETTINGS_WINDOW_H: f32 = 864.0;
+    // "Save settings" sits at y≈798, below the fold of the 760px test window.
+    // The content column is top-anchored, so the button stays at that offset in
+    // any window tall enough to show it.
     const SETTINGS_SAVE_Y: f32 = 798.0;
+    // Height the settings page needs before "Save settings" is on screen at
+    // all; below this the form has to be scrolled.
+    const SETTINGS_FORM_BOTTOM: f32 = 820.0;
+    // Once the content is scrolled to its end, the save button comes to rest
+    // around here in the 760px window.
+    const SCROLLED_SAVE_Y: f32 = 680.0;
 
     fn open_shell(cx: &mut TestAppContext) -> (Entity<Shell>, VisualTestContext) {
         open_shell_sized(cx, WINDOW_W, WINDOW_H)
+    }
+
+    /// Opens the shell the way `main` does, with `WindowOptions::default()`.
+    fn open_shell_default(cx: &mut TestAppContext) -> (Entity<Shell>, VisualTestContext) {
+        open_shell_with_bounds(cx, None)
     }
 
     fn open_shell_sized(
@@ -3027,14 +3039,27 @@ mod ui_click_tests {
         window_w: f32,
         window_h: f32,
     ) -> (Entity<Shell>, VisualTestContext) {
+        open_shell_with_bounds(
+            cx,
+            Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(window_w), px(window_h)),
+            )),
+        )
+    }
+
+    /// Opens the shell the way `main` does. Passing `None` keeps
+    /// `WindowOptions::default()`, which is how the real app opens its window -
+    /// that is the size the app is actually launched at.
+    fn open_shell_with_bounds(
+        cx: &mut TestAppContext,
+        bounds: Option<Bounds<Pixels>>,
+    ) -> (Entity<Shell>, VisualTestContext) {
         let mut shell = None;
         let handle = cx.update(|cx| {
             cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(
-                        point(px(0.), px(0.)),
-                        size(px(window_w), px(window_h)),
-                    ))),
+                    window_bounds: bounds.map(gpui::WindowBounds::Windowed),
                     ..Default::default()
                 },
                 |_window, cx| {
@@ -3068,10 +3093,79 @@ mod ui_click_tests {
         })
     }
 
+    // Wheel scrolling inside the content area. The settings form is taller than
+    // a short window, so the save button only becomes reachable once scrolled.
+    // Scrolling far past the end clamps, which makes the result deterministic.
+    fn scroll_content(visual: &mut VisualTestContext, events: usize) {
+        for _ in 0..events {
+            visual.simulate_event(ScrollWheelEvent {
+                position: point(px(FORM_CLICK_X), px(400.0)),
+                delta: ScrollDelta::Lines(point(0.0, -1.0)),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            });
+        }
+        visual.run_until_parked();
+    }
+
+    #[test]
+    fn saving_settings_works_in_a_window_too_short_for_the_form() {
+        let mut cx = TestAppContext::single();
+        let (shell, mut visual) = open_shell(&mut cx);
+        assert_eq!(state(&mut visual, &shell).0, Page::Settings);
+
+        // At 760px the save button sits below the fold: without scrolling, a
+        // click near the bottom edge must not reach it.
+        click(&mut visual, FORM_CLICK_X, WINDOW_H - 40.0);
+        assert_eq!(
+            state(&mut visual, &shell).0,
+            Page::Settings,
+            "the save button is below the fold before scrolling"
+        );
+
+        click(&mut visual, FORM_CLICK_X, FIELD_BUSINESS_NAME_Y);
+        visual.simulate_input("Acme Studio");
+        visual.run_until_parked();
+
+        // Scrolling far past the end must clamp, leaving the button pinned near
+        // the bottom of the visible area, where it can finally be clicked.
+        scroll_content(&mut visual, 400);
+        click(&mut visual, FORM_CLICK_X, SCROLLED_SAVE_Y);
+        visual.run_until_parked();
+
+        let (page, error, status) = visual.update(|_, cx| {
+            let shell = shell.read(cx);
+            (shell.page, shell.error.clone(), shell.status.clone())
+        });
+        assert_eq!(error, None, "save reported an error: {error:?}");
+        assert_eq!(page, Page::Overview, "a scrolled save must go through");
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|status| status.contains("settings saved")),
+            "expected a confirmation, got {status:?}"
+        );
+    }
+
+    #[test]
+    fn the_default_window_is_tall_enough_to_show_the_save_button() {
+        // The settings test clicks the button without scrolling, so the app's
+        // real default window has to be tall enough to put it on screen. This
+        // pins that assumption instead of hardcoding a window size.
+        let mut cx = TestAppContext::single();
+        let (_, mut visual) = open_shell_default(&mut cx);
+
+        let height = visual.update(|window, _| f32::from(window.viewport_size().height));
+        assert!(
+            height >= SETTINGS_FORM_BOTTOM,
+            "default viewport is {height}px, so the save button would need scrolling"
+        );
+    }
+
     #[test]
     fn filling_the_settings_form_and_clicking_save_persists_and_advances() {
         let mut cx = TestAppContext::single();
-        let (shell, mut visual) = open_shell_sized(&mut cx, SETTINGS_WINDOW_W, SETTINGS_WINDOW_H);
+        let (shell, mut visual) = open_shell_default(&mut cx);
         assert_eq!(state(&mut visual, &shell).0, Page::Settings);
 
         click(&mut visual, FORM_CLICK_X, FIELD_BUSINESS_NAME_Y);
@@ -3116,6 +3210,26 @@ mod ui_click_tests {
                 .expect("read setting")
         });
         assert_eq!(stored.as_deref(), Some("Acme Studio"));
+    }
+
+    #[test]
+    fn every_settings_field_can_be_clicked_to_take_focus() {
+        let mut cx = TestAppContext::single();
+        let (shell, mut visual) = open_shell(&mut cx);
+
+        for (field, y) in [
+            (Field::BusinessName, FIELD_BUSINESS_NAME_Y),
+            (Field::BusinessAddress, FIELD_BUSINESS_ADDRESS_Y),
+            (Field::Currency, FIELD_CURRENCY_Y),
+            (Field::InvoicePrefix, FIELD_INVOICE_PREFIX_Y),
+        ] {
+            click(&mut visual, FORM_CLICK_X, y);
+            assert_eq!(
+                state(&mut visual, &shell).1,
+                Some(field),
+                "clicking at y={y} should focus {field:?}"
+            );
+        }
     }
 
     #[test]
