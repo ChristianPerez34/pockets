@@ -386,6 +386,24 @@ impl Shell {
         };
         self.text_cursor = self.text_cursor.min(self.field_value(field).len());
         let key = event.keystroke.key.to_string().to_ascii_lowercase();
+        // Paste with Cmd+V (macOS) or Ctrl+V (other platforms).
+        if key == "v"
+            && (event.keystroke.modifiers.platform || event.keystroke.modifiers.control)
+            && !event.keystroke.modifiers.alt
+        {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let pasted: String = text.replace(['\n', '\r'], " ").into();
+                let pasted: String =
+                    pasted.chars().filter(|c| !c.is_control()).collect();
+                if !pasted.is_empty() {
+                    let cursor = self.text_cursor;
+                    self.text_cursor =
+                        insert_text_at(self.field_value_mut(field), cursor, &pasted);
+                    cx.notify();
+                }
+            }
+            return;
+        }
         match key.as_str() {
             "backspace" => {
                 let cursor = self.text_cursor;
@@ -1785,7 +1803,7 @@ impl Shell {
                             "Add a client"
                         })
                         .child(client_form)
-                        .child("Click a field and type. Use ←/→, Home/End, Backspace, or Delete to edit; paste is not supported yet."),
+                        .child("Click a field and type. Use ←/→, Home/End, Backspace, or Delete to edit; paste with Cmd/Ctrl+V."),
                 )
         }
     }
