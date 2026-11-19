@@ -8,6 +8,9 @@ use gpui::{
     Window, WindowOptions, div, prelude::*, px, rgb,
 };
 
+const DEFAULT_MANUAL_START: &str = "09:00 AM";
+const DEFAULT_MANUAL_END: &str = "10:00 AM";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     Overview,
@@ -218,9 +221,9 @@ impl Shell {
             timer_description: String::new(),
             manual_description: String::new(),
             manual_date: today.clone(),
-            manual_start: "09:00 AM".to_string(),
+            manual_start: DEFAULT_MANUAL_START.to_string(),
             manual_end_date: today.clone(),
-            manual_end: "10:00 AM".to_string(),
+            manual_end: DEFAULT_MANUAL_END.to_string(),
             manual_billable: true,
             editing_entry: None,
             milestone_name: String::new(),
@@ -1078,9 +1081,9 @@ impl Shell {
                 self.manual_description.clear();
                 let today = domain::iso_date_from_unix(storage::now_unix());
                 self.manual_date = today.clone();
-                self.manual_start = "09:00 AM".to_string();
+                self.manual_start = DEFAULT_MANUAL_START.to_string();
                 self.manual_end_date = today;
-                self.manual_end = "10:00 AM".to_string();
+                self.manual_end = DEFAULT_MANUAL_END.to_string();
                 self.manual_billable = true;
                 self.refresh();
                 self.error = None;
@@ -2545,77 +2548,69 @@ fn format_money(cents: i64, currency: &str) -> String {
     format!("{} {}", currency, format_amount_input(cents))
 }
 
-fn parse_time_of_day(time: &str) -> Result<(i64, i64), String> {
+const TIME_FORMAT_HINT: &str = "Time must use HH:MM AM/PM in UTC.";
+const TIME_VALUE_HINT: &str = "Time must be a valid HH:MM AM/PM value in UTC.";
+
+fn parse_time_of_day(time: &str) -> Result<i64, String> {
     let mut raw = time.trim();
-    if raw.to_ascii_uppercase().ends_with("UTC") {
+    if raw.len() > 3
+        && raw.to_ascii_uppercase().ends_with("UTC")
+        && raw.as_bytes()[raw.len() - 4].is_ascii_whitespace()
+    {
         raw = raw[..raw.len() - 3].trim_end();
     }
 
-    let (time_part, period) = if let Some(stripped) = raw.strip_suffix(|c| c == 'm' || c == 'M') {
-        let stripped = stripped.trim_end();
-        if let Some(prefix) = stripped.strip_suffix(|c| c == 'a' || c == 'A') {
-            (prefix.trim_end(), Some("AM"))
-        } else if let Some(prefix) = stripped.strip_suffix(|c| c == 'p' || c == 'P') {
-            (prefix.trim_end(), Some("PM"))
+    let (time_part, meridiem_offset) =
+        if let Some(stripped) = raw.strip_suffix(|c| c == 'm' || c == 'M') {
+            if let Some(prefix) = stripped.strip_suffix(|c| c == 'a' || c == 'A') {
+                (prefix.trim_end(), Some(0))
+            } else if let Some(prefix) = stripped.strip_suffix(|c| c == 'p' || c == 'P') {
+                (prefix.trim_end(), Some(12))
+            } else {
+                return Err(TIME_FORMAT_HINT.to_string());
+            }
         } else {
-            return Err("Time must use HH:MM AM/PM in UTC.".to_string());
-        }
-    } else {
-        (raw, None)
-    };
+            (raw, None)
+        };
 
     let mut parts = time_part.split(':');
     let hour = parts
         .next()
-        .and_then(|p| p.trim().parse::<i64>().ok())
-        .ok_or_else(|| "Time must use HH:MM AM/PM in UTC.".to_string())?;
+        .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|p| p.parse::<i64>().ok())
+        .ok_or_else(|| TIME_FORMAT_HINT.to_string())?;
     let minute = parts
         .next()
-        .and_then(|p| p.trim().parse::<i64>().ok())
-        .ok_or_else(|| "Time must use HH:MM AM/PM in UTC.".to_string())?;
+        .filter(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|p| p.parse::<i64>().ok())
+        .ok_or_else(|| TIME_FORMAT_HINT.to_string())?;
 
     if parts.next().is_some() || !(0..=59).contains(&minute) {
-        return Err("Time must be a valid HH:MM AM/PM value in UTC.".to_string());
+        return Err(TIME_VALUE_HINT.to_string());
     }
 
-    let hour24 = match period {
-        Some("AM") => {
+    let hour24 = match meridiem_offset {
+        Some(offset) => {
             if !(1..=12).contains(&hour) {
-                return Err("Hour must be between 1 and 12 in 12-hour format.".to_string());
+                return Err("Hour must be between 1 and 12 for AM/PM times in UTC.".to_string());
             }
-            if hour == 12 {
-                0
-            } else {
-                hour
-            }
-        }
-        Some("PM") => {
-            if !(1..=12).contains(&hour) {
-                return Err("Hour must be between 1 and 12 in 12-hour format.".to_string());
-            }
-            if hour == 12 {
-                12
-            } else {
-                hour + 12
-            }
+            hour % 12 + offset
         }
         None => {
             if !(0..=23).contains(&hour) {
-                return Err("Time must be a valid HH:MM AM/PM value in UTC.".to_string());
+                return Err(TIME_VALUE_HINT.to_string());
             }
             hour
         }
-        _ => return Err("Time must use HH:MM AM/PM in UTC.".to_string()),
     };
 
-    Ok((hour24, minute))
+    Ok(hour24 * 3_600 + minute * 60)
 }
 
 fn parse_utc_datetime(date: &str, time: &str) -> Result<i64, String> {
     let midnight = domain::iso_date_to_unix_seconds(date).map_err(|error| error.to_string())?;
-    let (hour, minute) = parse_time_of_day(time)?;
     midnight
-        .checked_add(hour * 3_600 + minute * 60)
+        .checked_add(parse_time_of_day(time)?)
         .ok_or_else(|| "Date and time are outside the supported range.".to_string())
 }
 
@@ -3127,6 +3122,12 @@ mod shell_tests {
         assert!(parse_utc_datetime("2024-03-04", "13:00 PM").is_err());
         assert!(parse_utc_datetime("2024-03-04", "12:60 AM").is_err());
         assert!(parse_utc_datetime("2024-03-04", "invalid").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "9 : 00 AM").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "9:00 A M").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "9:00 AMUTC").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "9:5 AM").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "+9:00 AM").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "-9:00 AM").is_err());
     }
 
     #[test]
