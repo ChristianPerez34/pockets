@@ -8,6 +8,9 @@ use gpui::{
     Window, WindowOptions, div, prelude::*, px, rgb,
 };
 
+const DEFAULT_MANUAL_START: &str = "09:00 AM";
+const DEFAULT_MANUAL_END: &str = "10:00 AM";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     Overview,
@@ -218,9 +221,9 @@ impl Shell {
             timer_description: String::new(),
             manual_description: String::new(),
             manual_date: today.clone(),
-            manual_start: "09:00".to_string(),
+            manual_start: DEFAULT_MANUAL_START.to_string(),
             manual_end_date: today.clone(),
-            manual_end: "10:00".to_string(),
+            manual_end: DEFAULT_MANUAL_END.to_string(),
             manual_billable: true,
             editing_entry: None,
             milestone_name: String::new(),
@@ -1078,9 +1081,9 @@ impl Shell {
                 self.manual_description.clear();
                 let today = domain::iso_date_from_unix(storage::now_unix());
                 self.manual_date = today.clone();
-                self.manual_start = "09:00".to_string();
+                self.manual_start = DEFAULT_MANUAL_START.to_string();
                 self.manual_end_date = today;
-                self.manual_end = "10:00".to_string();
+                self.manual_end = DEFAULT_MANUAL_END.to_string();
                 self.manual_billable = true;
                 self.refresh();
                 self.error = None;
@@ -1876,9 +1879,9 @@ impl Shell {
             .gap_2()
             .child(self.text_field("Description", Field::ManualDescription, cx))
             .child(self.text_field("Start date (YYYY-MM-DD, UTC)", Field::ManualDate, cx))
-            .child(self.text_field("Start time (HH:MM, UTC)", Field::ManualStart, cx))
+            .child(self.text_field("Start time (HH:MM AM/PM, UTC)", Field::ManualStart, cx))
             .child(self.text_field("End date (YYYY-MM-DD, UTC)", Field::ManualEndDate, cx))
-            .child(self.text_field("End time (HH:MM, UTC)", Field::ManualEnd, cx))
+            .child(self.text_field("End time (HH:MM AM/PM, UTC)", Field::ManualEnd, cx))
             .child(
                 div()
                     .p_2()
@@ -2545,28 +2548,83 @@ fn format_money(cents: i64, currency: &str) -> String {
     format!("{} {}", currency, format_amount_input(cents))
 }
 
-fn parse_utc_datetime(date: &str, time: &str) -> Result<i64, String> {
-    let midnight = domain::iso_date_to_unix_seconds(date).map_err(|error| error.to_string())?;
-    let mut parts = time.split(':');
+const TIME_FORMAT_HINT: &str = "Time must use HH:MM AM/PM in UTC.";
+const TIME_VALUE_HINT: &str = "Time must be a valid HH:MM AM/PM value in UTC.";
+
+fn parse_time_of_day(time: &str) -> Result<i64, String> {
+    let mut raw = time.trim();
+    if raw.len() > 3
+        && raw.to_ascii_uppercase().ends_with("UTC")
+        && raw.as_bytes()[raw.len() - 4].is_ascii_whitespace()
+    {
+        raw = raw[..raw.len() - 3].trim_end();
+    }
+
+    let (time_part, meridiem_offset) =
+        if let Some(stripped) = raw.strip_suffix(|c| c == 'm' || c == 'M') {
+            if let Some(prefix) = stripped.strip_suffix(|c| c == 'a' || c == 'A') {
+                (prefix.trim_end(), Some(0))
+            } else if let Some(prefix) = stripped.strip_suffix(|c| c == 'p' || c == 'P') {
+                (prefix.trim_end(), Some(12))
+            } else {
+                return Err(TIME_FORMAT_HINT.to_string());
+            }
+        } else {
+            (raw, None)
+        };
+
+    let mut parts = time_part.split(':');
     let hour = parts
         .next()
-        .and_then(|part| part.parse::<i64>().ok())
-        .ok_or_else(|| "Time must use HH:MM in UTC.".to_string())?;
+        .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|p| p.parse::<i64>().ok())
+        .ok_or_else(|| TIME_FORMAT_HINT.to_string())?;
     let minute = parts
         .next()
-        .and_then(|part| part.parse::<i64>().ok())
-        .ok_or_else(|| "Time must use HH:MM in UTC.".to_string())?;
-    if parts.next().is_some() || !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
-        return Err("Time must be a valid 24-hour HH:MM value in UTC.".to_string());
+        .filter(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|p| p.parse::<i64>().ok())
+        .ok_or_else(|| TIME_FORMAT_HINT.to_string())?;
+
+    if parts.next().is_some() || !(0..=59).contains(&minute) {
+        return Err(TIME_VALUE_HINT.to_string());
     }
+
+    let hour24 = match meridiem_offset {
+        Some(offset) => {
+            if !(1..=12).contains(&hour) {
+                return Err("Hour must be between 1 and 12 for AM/PM times in UTC.".to_string());
+            }
+            hour % 12 + offset
+        }
+        None => {
+            if !(0..=23).contains(&hour) {
+                return Err(TIME_VALUE_HINT.to_string());
+            }
+            hour
+        }
+    };
+
+    Ok(hour24 * 3_600 + minute * 60)
+}
+
+fn parse_utc_datetime(date: &str, time: &str) -> Result<i64, String> {
+    let midnight = domain::iso_date_to_unix_seconds(date).map_err(|error| error.to_string())?;
     midnight
-        .checked_add(hour * 3_600 + minute * 60)
+        .checked_add(parse_time_of_day(time)?)
         .ok_or_else(|| "Date and time are outside the supported range.".to_string())
 }
 
 fn format_time_utc(timestamp: i64) -> String {
     let seconds = timestamp.rem_euclid(86_400);
-    format!("{:02}:{:02}", seconds / 3_600, (seconds % 3_600) / 60)
+    let hour24 = seconds / 3_600;
+    let minute = (seconds % 3_600) / 60;
+    let (hour12, period) = match hour24 {
+        0 => (12, "AM"),
+        1..=11 => (hour24, "AM"),
+        12 => (12, "PM"),
+        _ => (hour24 - 12, "PM"),
+    };
+    format!("{:02}:{:02} {}", hour12, minute, period)
 }
 
 fn format_timestamp_utc(timestamp: i64) -> String {
@@ -2932,9 +2990,9 @@ mod shell_tests {
         // One deterministic billable hour, independent of the wall clock.
         app.manual_description = "Design".to_string();
         app.manual_date = "2024-03-04".to_string();
-        app.manual_start = "09:00".to_string();
+        app.manual_start = "09:00 AM".to_string();
         app.manual_end_date = "2024-03-04".to_string();
-        app.manual_end = "10:00".to_string();
+        app.manual_end = "10:00 AM".to_string();
         app.manual_billable = true;
         app.save_manual_entry();
         assert!(
@@ -2997,6 +3055,103 @@ mod shell_tests {
         assert_eq!(app.selected_client_id, Some(first));
         assert_eq!(app.selected_client_id, app.clients.first().map(|c| c.id));
         assert!(app.clients.iter().any(|c| c.id == second));
+    }
+
+    #[test]
+    fn format_time_utc_uses_12_hour_am_pm() {
+        assert_eq!(format_time_utc(0), "12:00 AM");
+        assert_eq!(format_time_utc(1_800), "12:30 AM");
+        assert_eq!(format_time_utc(3_600), "01:00 AM");
+        assert_eq!(format_time_utc(9 * 3_600), "09:00 AM");
+        assert_eq!(format_time_utc(11 * 3_600 + 59 * 60), "11:59 AM");
+        assert_eq!(format_time_utc(12 * 3_600), "12:00 PM");
+        assert_eq!(format_time_utc(12 * 3_600 + 30 * 60), "12:30 PM");
+        assert_eq!(format_time_utc(13 * 3_600), "01:00 PM");
+        assert_eq!(format_time_utc(23 * 3_600 + 59 * 60), "11:59 PM");
+    }
+
+    #[test]
+    fn format_timestamp_utc_includes_date_and_12_hour_time() {
+        let ts = domain::iso_date_to_unix_seconds("2024-03-04").unwrap() + 9 * 3_600;
+        assert_eq!(format_timestamp_utc(ts), "2024-03-04 09:00 AM");
+
+        let ts_pm = domain::iso_date_to_unix_seconds("2024-03-04").unwrap() + 15 * 3_600 + 30 * 60;
+        assert_eq!(format_timestamp_utc(ts_pm), "2024-03-04 03:30 PM");
+    }
+
+    #[test]
+    fn parse_utc_datetime_accepts_12_hour_am_pm_variants() {
+        let base = domain::iso_date_to_unix_seconds("2024-03-04").unwrap();
+
+        assert_eq!(parse_utc_datetime("2024-03-04", "12:00 AM").unwrap(), base);
+        assert_eq!(parse_utc_datetime("2024-03-04", "12:00 am").unwrap(), base);
+        assert_eq!(parse_utc_datetime("2024-03-04", "12:00am").unwrap(), base);
+        assert_eq!(parse_utc_datetime("2024-03-04", "09:00 AM").unwrap(), base + 9 * 3_600);
+        assert_eq!(parse_utc_datetime("2024-03-04", "9:00 AM").unwrap(), base + 9 * 3_600);
+        assert_eq!(parse_utc_datetime("2024-03-04", "9:00 AM UTC").unwrap(), base + 9 * 3_600);
+        assert_eq!(parse_utc_datetime("2024-03-04", "12:00 PM").unwrap(), base + 12 * 3_600);
+        assert_eq!(
+            parse_utc_datetime("2024-03-04", "01:30 PM").unwrap(),
+            base + 13 * 3_600 + 30 * 60
+        );
+        assert_eq!(
+            parse_utc_datetime("2024-03-04", "1:30 pm").unwrap(),
+            base + 13 * 3_600 + 30 * 60
+        );
+        assert_eq!(
+            parse_utc_datetime("2024-03-04", "11:59 PM").unwrap(),
+            base + 23 * 3_600 + 59 * 60
+        );
+    }
+
+    #[test]
+    fn parse_utc_datetime_accepts_24_hour_fallback() {
+        let base = domain::iso_date_to_unix_seconds("2024-03-04").unwrap();
+        assert_eq!(parse_utc_datetime("2024-03-04", "09:00").unwrap(), base + 9 * 3_600);
+        assert_eq!(
+            parse_utc_datetime("2024-03-04", "13:30").unwrap(),
+            base + 13 * 3_600 + 30 * 60
+        );
+    }
+
+    #[test]
+    fn parse_utc_datetime_rejects_invalid_times() {
+        assert!(parse_utc_datetime("2024-03-04", "00:00 AM").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "13:00 AM").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "00:00 PM").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "13:00 PM").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "12:60 AM").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "invalid").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "9 : 00 AM").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "9:00 A M").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "9:00 AMUTC").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "9:5 AM").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "+9:00 AM").is_err());
+        assert!(parse_utc_datetime("2024-03-04", "-9:00 AM").is_err());
+    }
+
+    #[test]
+    fn editing_entry_populates_12_hour_format() {
+        let mut app = shell();
+        app.business_name = "Acme".to_string();
+        app.save_settings();
+        app.client_name = "Northwind".to_string();
+        app.save_client();
+        app.project_name = "Website".to_string();
+        app.create_project();
+
+        app.manual_description = "Design".to_string();
+        app.manual_date = "2024-03-04".to_string();
+        app.manual_start = "02:30 PM".to_string();
+        app.manual_end_date = "2024-03-04".to_string();
+        app.manual_end = "03:45 PM".to_string();
+        app.save_manual_entry();
+
+        let entry_id = app.entries[0].id;
+        app.begin_edit_entry(entry_id);
+
+        assert_eq!(app.manual_start, "02:30 PM");
+        assert_eq!(app.manual_end, "03:45 PM");
     }
 }
 
